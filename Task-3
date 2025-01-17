@@ -1,0 +1,95 @@
+# fine tuning LLM model (distilgpt2)
+# distilgpt2 is a model with less number of parameters that can easily be trained
+
+from IPython import get_ipython
+from IPython.display import display
+from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer, TrainingArguments
+from datasets import load_dataset, Dataset, DatasetDict
+import torch
+
+# Load your dataset from Hugging Face's datasets hub
+data = load_dataset("Cynaptics/persona-chat")
+
+# Inspect the dataset structure to identify the correct keys for persona and response
+print(data['train'][0])  # Print the first example to see the structure
+
+train_data = [
+    {"text": f"Persona: {item['persona_b'][0]}\nDialogue: {' '.join(item['dialogue'])}\nReference: {item['reference']}"} 
+    for item in data['train']
+]  
+dataset = Dataset.from_dict({"text": [item["text"] for item in train_data]})
+
+# Split into train and validation datasets
+dataset = dataset.train_test_split(test_size=0.1)
+
+# Load a smaller pre-trained model and tokenizer
+model_name = "distilgpt2"
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+# If tokenizer does not have pad token, add it
+if tokenizer.pad_token is None:
+    tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+
+# Resize the tokenizer's vocabulary to include all token IDs in the dataset
+# This will prevent the IndexError
+def tokenize_function(examples):
+    return tokenizer(examples["text"], padding="max_length", truncation=True, max_length=512)
+
+tokenized_datasets = dataset.map(tokenize_function, batched=True)
+# Get the maximum token ID in the dataset
+max_token_id = 0
+for split in tokenized_datasets.values():  # Iterate over the values of tokenized_datasets (the datasets themselves)
+    for item in split:  # Now, 'item' will be a dictionary-like object representing a data example
+        max_token_id = max(max_token_id, max(item['input_ids']))
+
+# Load the model before resizing embeddings
+model = AutoModelForCausalLM.from_pretrained(model_name)
+
+# Resize the model's embeddings to match the tokenizer's vocabulary size
+# Adding 1 to max_token_id to account for the unknown token
+model.resize_token_embeddings(max_token_id + 1)
+
+# Set up training arguments
+training_args = TrainingArguments(
+    output_dir="./persona_model",
+    evaluation_strategy="epoch",
+    learning_rate=5e-3,
+    per_device_train_batch_size=4,
+    num_train_epochs=1,
+    weight_decay=0.01,
+    save_total_limit=2,
+    push_to_hub=False,
+)
+
+# Define a custom compute_loss function
+class CustomTrainer(Trainer):
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None): # Add num_items_in_batch
+        """
+        This function is used to calculate the loss during training.
+        It shifts the labels to the left by one position to align with the model's predictions.
+        """
+        outputs = model(**inputs)
+        # Shift labels to the left by one position
+        labels = inputs["input_ids"][:, 1:].contiguous()  # Remove the first token (BOS)
+        # Flatten the logits and labels for calculating loss
+        logits = outputs.logits[:, :-1, :].contiguous().view(-1, model.config.vocab_size)  # Remove the last token (EOS)
+        labels = labels.view(-1)
+        # Calculate the cross-entropy loss
+        loss = torch.nn.functional.cross_entropy(logits, labels)
+        return (loss, outputs) if return_outputs else loss
+
+# Define a Trainer using the custom Trainer class
+trainer = CustomTrainer(  # Use CustomTrainer instead of Trainer
+    model=model,
+    args=training_args,
+    train_dataset=tokenized_datasets["train"],
+    eval_dataset=tokenized_datasets["test"],
+    tokenizer=tokenizer,
+)
+
+# Train the model
+trainer.train()
+
+# Save the fine-tuned model
+model.save_pretrained("./fine_tuned_persona_model")
+tokenizer.save_pretrained("./fine_tuned_persona_model")
